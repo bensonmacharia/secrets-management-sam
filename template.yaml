@@ -1,0 +1,138 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: >-
+  secrets-management-sam
+
+Transform:
+  - AWS::Serverless-2016-10-31
+
+Resources:
+  # Create an API Gateway with API auth Key
+  ApiGatewayEndpoint:
+    Type: "AWS::Serverless::Api"
+    Properties:
+      StageName: Prod
+      Auth:
+        # Require API Key for all endpoints
+        ApiKeyRequired: true
+        UsagePlan:
+          CreateUsagePlan: PER_API
+          UsagePlanName: GatewayAuthorization
+
+  # A Queue to keep our notes
+  NotesSQSQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: NotesQueue
+      VisibilityTimeout: 300
+      MessageRetentionPeriod: 86400
+
+  # A Secret Manager to keep our basic auth secret
+  AuthTokenSecretManager:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: AuthTokenSecretManager
+      Description: "This secret has a dynamically generated secret token."
+      # Generate a random string 32 charatcers long for api Basic authentication
+      GenerateSecretString:
+        GenerateStringKey: "authtoken"
+        PasswordLength: 32
+        ExcludeCharacters: '"@/\:;+*'''
+        SecretStringTemplate: '{"username": "samuser"}'
+
+  # This is a Lambda function config associated with the source code: auth-token.js for fetching the secret from secrets manager and creating an auth token
+  authTokenFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/auth-token.authTokenrHandler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 100
+      Description: A HTTP GET method to fetch a BASIC auth secret from secrets manager.
+      Policies:
+        # Give Permissions to the AuthTokenSecretManager
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref AuthTokenSecretManager
+      Environment:
+        Variables:
+          # Make secret manager name accessible as environment variable from function code during execution
+          SECRET_MANAGER: !Ref AuthTokenSecretManager
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: ApiGatewayEndpoint
+            Path: /v1/auth/token
+            Method: GET
+
+  # This is a Lambda function config associated with the source code: add-note.js for adding a note into our SQS Queue
+  addNotesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/add-note.addNoteHandler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 100
+      Description: Includes a HTTP post method to add one note to our SQS Queue.
+      Policies:
+        # Give Permissions to the AuthTokenSecretManager and the NotesSQSQueue
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref AuthTokenSecretManager
+        - SQSSendMessagePolicy: # to allow this funciton to send message in queue
+            QueueName: !GetAtt NotesSQSQueue.QueueName
+      Environment:
+        Variables:
+          # Make secret manager name and queue url accessible as environment variable from function code during execution
+          SECRET_MANAGER: !Ref AuthTokenSecretManager
+          QUEUE_URL: !GetAtt NotesSQSQueue.QueueUrl
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: ApiGatewayEndpoint
+            Path: /v1/api/note
+            Method: POST
+
+  # This is a Lambda function config associated with the source code: get-all-notes.js for polling our notes from the Queue.
+  getAllNotesFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Handler: src/handlers/get-all-notes.getAllNotesHandler
+      Runtime: nodejs18.x
+      Architectures:
+        - x86_64
+      MemorySize: 128
+      Timeout: 100
+      Description: Includes a HTTP get method to poll our notes from the Queue.
+      Policies:
+        # Give Permissions to the AuthTokenSecretManager and the NotesSQSQueue
+        - AWSSecretsManagerGetSecretValuePolicy:
+            SecretArn: !Ref AuthTokenSecretManager
+        - SQSPollerPolicy: # to allow this funciton to send message in queue
+            QueueName: !GetAtt NotesSQSQueue.QueueName
+      Environment:
+        Variables:
+          # Make secret manager name and queue url accessible as environment variable from function code during execution
+          SECRET_MANAGER: !Ref AuthTokenSecretManager
+          QUEUE_URL: !GetAtt NotesSQSQueue.QueueUrl
+      Events:
+        Api:
+          Type: Api
+          Properties:
+            RestApiId:
+              Ref: ApiGatewayEndpoint
+            Path: /v1/api/notes
+            Method: GET
+
+Outputs:
+  ApiGateway:
+    Description: "The URL is:"
+    Value: !Sub "https://${ApiGatewayEndpoint}.execute-api.${AWS::Region}.amazonaws.com/Prod/"
+  ApiKey:
+    Description: "You can find your API Key in the AWS console: (Put in the request HEADER as 'x-api-key')"
+    Value: !Sub "https://console.aws.amazon.com/apigateway/home?region=${AWS::Region}#/api-keys/${ApiGatewayEndpointApiKey}"
